@@ -47,8 +47,13 @@ const { server } = createApp();
 server.listen(0, '0.0.0.0', async () => {
   const address = server.address();
   const port = typeof address === 'object' && address ? address.port : 0;
-  await register(port);
+  if (!(await register(port))) {
+    process.stderr.write(`[entry] the env never took port ${port}: giving up\n`);
+    process.exit(1);
+  }
   await waitForDone();
+  // The trial is over: drop every socket the suite still holds and leave at once.
   server.close(() => process.exit(0));
-  setTimeout(() => process.exit(0), 2_000).unref();
+  server.closeAllConnections?.();
+  setTimeout(() => process.exit(0), 500).unref();
 });

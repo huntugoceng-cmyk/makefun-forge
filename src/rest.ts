@@ -103,7 +103,9 @@ function issueJson(ctx: Ctx, repo: Repo, issue: Issue) {
 const ISSUE_JSON_CACHE = new Map<number, { sig: string; json: ReturnType<typeof issueJson> }>();
 
 function issueJsonCached(ctx: Ctx, repo: Repo, issue: Issue) {
-  const sig = `${ctx.base}|${issue.updatedAt}|${issue.state}|${issue.comments.length}|${issue.labels.join(',')}|${issue.title}|${issue.body}`;
+  // updatedAt moves on every mutation the REST surface makes, and a comment or a label
+  // added moves a count beside it: those three date the object this cache keeps.
+  const sig = `${ctx.base}|${issue.updatedAt}|${issue.state}|${issue.comments.length}|${issue.labels.length}`;
   const hit = ISSUE_JSON_CACHE.get(issue.id);
   if (hit && hit.sig === sig) return hit.json;
   const json = issueJson(ctx, repo, issue);
@@ -645,8 +647,7 @@ export function handleRest(ctx: Ctx): boolean {
 
   if (rest === 'issues/:number' || /^issues\/\d+$/.test(rest)) {
     const num = Number(rest.split('/')[1]);
-    const list = store.issueList(repo.id);
-    const issue = list.find((i) => i.number === num && !i.isPull);
+    const issue = store.issueByNumber(repo.id, num);
     if (ctx.method === 'GET') {
       if (!issue) { notFound(ctx); return true; }
       ctx.json(200, issueJsonCached(ctx, repo, issue));
@@ -671,7 +672,7 @@ export function handleRest(ctx: Ctx): boolean {
   const commentsMatch = /^issues\/(\d+)\/comments$/.exec(rest);
   if (commentsMatch) {
     const num = Number(commentsMatch[1]);
-    const issue = store.issueList(repo.id).find((i) => i.number === num);
+    const issue = store.issueByNumber(repo.id, num, true);
     if (!issue) { notFound(ctx); return true; }
     if (ctx.method === 'GET') {
       ctx.json(200, issue.comments.map((c) => ({ id: c.id, body: c.body, user: { login: c.user }, created_at: c.createdAt })));

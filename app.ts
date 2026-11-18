@@ -1,5 +1,4 @@
 // The HTTP surface: git smart HTTP, REST v3, GraphQL and MCP on one server.
-import { randomUUID } from 'node:crypto';
 import { createServer } from 'node:http';
 import type { IncomingMessage, ServerResponse, Server } from 'node:http';
 
@@ -21,9 +20,18 @@ function readBody(req: IncomingMessage): Promise<Buffer> {
       if (size > 256 * 1024 * 1024) { reject(new Error('body too large')); req.destroy(); return; }
       chunks.push(c);
     });
-    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('end', () => resolve(chunks.length === 1 ? chunks[0] : Buffer.concat(chunks)));
     req.on('error', reject);
   });
+}
+
+/** A method whose request may carry a body; everything else skips the body reader. */
+function mayHaveBody(req: IncomingMessage): boolean {
+  const method = req.method ?? 'GET';
+  if (method === 'GET' || method === 'HEAD' || method === 'OPTIONS') return false;
+  if (req.headers['transfer-encoding'] !== undefined) return true;
+  const length = req.headers['content-length'];
+  return length !== undefined && length !== '0';
 }
 
 function tokenOf(req: IncomingMessage): string | null {
@@ -31,6 +39,33 @@ function tokenOf(req: IncomingMessage): string | null {
   if (!header) return null;
   const m = /^(?:Bearer|token)\s+(.+)$/i.exec(header.trim());
   return m ? m[1].trim() : null;
+}
+
+/** Query parameters, decoded only when a route asks for one. */
+class LazyQuery {
+  private map: URLSearchParams | null = null;
+  private readonly search: string;
+  constructor(search: string) {
+    this.search = search;
+  }
+  get(name: string): string | null {
+    if (this.map === null) this.map = new URLSearchParams(this.search);
+    return this.map.get(name);
+  }
+  entries(): IterableIterator<[string, string]> {
+    if (this.map === null) this.map = new URLSearchParams(this.search);
+    return this.map.entries();
+  }
+}
+
+const SLASH = 0x2f;
+
+function splitPath(target: string): { path: string; search: string } {
+  const q = target.indexOf('?');
+  const raw = q === -1 ? target : target.slice(0, q);
+  const search = q === -1 ? '' : target.slice(q + 1);
+  const path = raw.indexOf('%') === -1 ? raw : decodeURI(raw);
+  return { path, search };
 }
 
 export interface AppOptions { now?: string; login?: string; token?: string }
@@ -41,25 +76,38 @@ export function createApp(options: AppOptions = {}): { server: Server; store: St
   const defaultToken = options.token ?? process.env.MAKEFUN_SHOP_TOKEN ?? 'makefun-token';
   store.addUser(login, defaultToken);
 
+  // A request id in GitHub's shape, from a counter: cheaper than a v4 UUID per request.
+  const runId = Math.floor(Math.random() * 0xffff_ffff).toString(16).padStart(8, '0');
+  let requestSeq = 0;
+  const nextRequestId = (): string => {
+    requestSeq = (requestSeq + 1) >>> 0;
+    return `${runId}-${requestSeq.toString(16).padStart(8, '0')}`;
+  };
+
   const server = createServer((req, res) => {
     void handle(req, res);
   });
+  server.keepAliveTimeout = 65_000;
+  server.headersTimeout = 70_000;
 
   const handle = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
-    const requestId = randomUUID();
-    const url = new URL(req.url ?? '/', 'http://forge.local');
-    const path = decodeURI(url.pathname);
+    const requestId = nextRequestId();
+    const { path, search } = splitPath(req.url ?? '/');
     let body: Buffer;
-    try {
-      body = await readBody(req);
-    } catch {
-      res.writeHead(413, { 'content-type': JSON_TYPE, 'x-github-request-id': requestId });
-      res.end(JSON.stringify({ message: 'Request body too large' }));
-      return;
+    if (mayHaveBody(req)) {
+      try {
+        body = await readBody(req);
+      } catch {
+        res.writeHead(413, { 'content-type': JSON_TYPE, 'x-github-request-id': requestId });
+        res.end(JSON.stringify({ message: 'Request body too large' }));
+        return;
+      }
+    } else {
+      body = EMPTY;
     }
 
     const send = (status: number, payload: Buffer | string, headers: Record<string, string> = {}): void => {
-      const buf = Buffer.isBuffer(payload) ? payload : Buffer.from(payload, 'utf8');
+      const buf = typeof payload === 'string' ? Buffer.from(payload, 'utf8') : payload;
       res.writeHead(status, {
         'content-type': JSON_TYPE,
         'x-github-request-id': requestId,
@@ -77,13 +125,13 @@ export function createApp(options: AppOptions = {}): { server: Server; store: St
       user,
       method: req.method ?? 'GET',
       path,
-      query: url.searchParams,
+      query: new LazyQuery(search) as unknown as Ctx['query'],
       body: null,
       base: `http://${req.headers.host ?? 'localhost'}`,
       json: (status, payload, headers) => send(status, JSON.stringify(payload), headers),
       text: (status, payload, headers) => send(status, payload, headers),
       raw: (status, payload, contentType, headers) => {
-        const buf = Buffer.from(payload, 'utf8');
+        const buf = typeof payload === 'string' ? Buffer.from(payload, 'utf8') : payload as Buffer;
         res.writeHead(status, { 'content-type': contentType, 'x-github-request-id': requestId, 'content-length': String(buf.length), ...headers });
         res.end(buf);
       },
@@ -100,7 +148,9 @@ export function createApp(options: AppOptions = {}): { server: Server; store: St
         return;
       }
       if (rest === '/info/refs' || rest.startsWith('/info/refs')) {
-        const service = url.searchParams.get('service') ?? '';
+        const service = search.indexOf('service=') === -1
+          ? ''
+          : new URLSearchParams(search).get('service') ?? '';
         if (service !== 'git-upload-pack' && service !== 'git-receive-pack') {
           send(400, JSON.stringify({ message: 'Unsupported service' }));
           return;
@@ -147,7 +197,7 @@ export function createApp(options: AppOptions = {}): { server: Server; store: St
     }
 
     if (path === '/healthz') {
-      send(200, JSON.stringify({ ok: true }));
+      send(200, HEALTH);
       return;
     }
 
@@ -193,3 +243,6 @@ export function createApp(options: AppOptions = {}): { server: Server; store: St
 
   return { server, store };
 }
+
+const EMPTY = Buffer.alloc(0);
+const HEALTH = Buffer.from('{"ok":true}', 'utf8');

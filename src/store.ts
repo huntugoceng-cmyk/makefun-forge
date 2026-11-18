@@ -1,6 +1,6 @@
 // The forge's own store: users, repositories, git objects and refs, issues,
 // labels and pull requests. One process, no outside service.
-import { buildCommit, buildTree, flatten, objectId, parseCommit, parseTree } from './git.ts';
+import { buildCommit, buildTree, flatten, objectId, parseCommitCached, parseTree } from './git.ts';
 import type { ObjType, PackedObject, TreeEntry } from './git.ts';
 
 export interface User {
@@ -80,6 +80,25 @@ export interface Pull {
 
 export const NOW_ISO = (iso: string): string => iso;
 
+/** Refs a repository holds, plus a version that every ref write bumps: the surfaces
+ *  that advertise or pack this repository's tip cache their bytes against it. */
+export class Refs extends Map<string, string> {
+  version = 0;
+
+  set(key: string, value: string): this {
+    const had = this.get(key);
+    super.set(key, value);
+    if (had !== value) this.version++;
+    return this;
+  }
+
+  delete(key: string): boolean {
+    const had = super.delete(key);
+    if (had) this.version++;
+    return had;
+  }
+}
+
 export class Store {
   users = new Map<string, User>();
   tokens = new Map<string, User>();
@@ -92,6 +111,8 @@ export class Store {
   /** Fixed clock: every timestamp the store writes comes from here. */
   private clock: () => string;
   private tick = 0;
+  /** number -> issue, per repository: the REST read path asks for the same issue over and over. */
+  private issueIndex = new Map<number, Map<number, Issue>>();
 
   constructor(now?: string) {
     const base = now ? Date.parse(now) : Date.parse('2026-11-18T00:00:00Z');
@@ -146,7 +167,7 @@ export class Store {
       description: opts.description ?? '',
       private: opts.private ?? false,
       defaultBranch: opts.defaultBranch ?? 'main',
-      refs: new Map(),
+      refs: new Refs(),
       createdAt: Date.parse(this.now()),
       updatedAt: Date.parse(this.now()),
       pushedAt: null,
@@ -159,6 +180,7 @@ export class Store {
     this.issues.set(repo.id, []);
     this.pulls.set(repo.id, []);
     this.labels.set(repo.id, []);
+    this.issueIndex.set(repo.id, new Map());
     if (repo.autoInit) this.initRepo(repo);
     return repo;
   }
@@ -168,6 +190,7 @@ export class Store {
     this.issues.delete(repo.id);
     this.pulls.delete(repo.id);
     this.labels.delete(repo.id);
+    this.issueIndex.delete(repo.id);
   }
 
   read(sha: string): PackedObject | null {
@@ -180,10 +203,10 @@ export class Store {
     return id;
   }
 
-  commitBody(sha: string): ReturnType<typeof parseCommit> | null {
+  commitBody(sha: string): ReturnType<typeof parseCommitCached> | null {
     const obj = this.read(sha);
     if (!obj || obj.type !== 'commit') return null;
-    return parseCommit(obj.body);
+    return parseCommitCached(sha, obj.body);
   }
 
   /** Writes a commit on top of `parent` whose tree holds `files`. */
@@ -274,6 +297,23 @@ export class Store {
 
   issueList(repoId: number): Issue[] {
     return this.issues.get(repoId) ?? [];
+  }
+
+  /** One issue by its number: indexed on the first miss, so a warm read finds it at once. */
+  issueByNumber(repoId: number, number: number, includePulls = false): Issue | null {
+    const index = this.issueIndex.get(repoId);
+    if (index) {
+      const hit = index.get(number);
+      if (hit && (includePulls || !hit.isPull)) return hit;
+    }
+    const list = this.issueList(repoId);
+    for (const issue of list) {
+      if (issue.number === number && (includePulls || !issue.isPull)) {
+        if (index) index.set(number, issue);
+        return issue;
+      }
+    }
+    return null;
   }
 
   pullList(repoId: number): Pull[] {

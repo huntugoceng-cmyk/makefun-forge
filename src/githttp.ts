@@ -22,9 +22,9 @@ export function parsePackets(buf: Buffer): { packets: Packet[]; rest: Buffer } {
   const packets: Packet[] = [];
   let p = 0;
   while (p + 4 <= buf.length) {
-    const lenHex = buf.subarray(p, p + 4).toString('ascii');
-    if (!/^[0-9a-fA-F]{4}$/.test(lenHex)) break;
+    const lenHex = buf.toString('ascii', p, p + 4);
     const len = parseInt(lenHex, 16);
+    if (!Number.isInteger(len) || /[^0-9a-fA-F]/.test(lenHex)) break;
     if (len === 0) { packets.push({ data: null, type: 'flush' }); p += 4; continue; }
     if (len === 1) { packets.push({ data: null, type: 'delim' }); p += 4; continue; }
     if (len < 4 || p + len > buf.length) break;
@@ -44,7 +44,26 @@ function refList(repo: Repo): [string, string][] {
   return out;
 }
 
+/** The refs' version, bumped by every write, so an advertisement can be cached. */
+function refsVersion(repo: Repo): number {
+  const v = (repo.refs as unknown as { version?: number }).version;
+  return typeof v === 'number' ? v : 0;
+}
+
+const ADVERTISEMENTS = new Map<string, Buffer>();
+const ADVERTISEMENTS_MAX = 256;
+
 export function advertiseInfoRefs(repo: Repo, service: string, version2: boolean): Buffer {
+  const cacheKey = `${repo.id}|${refsVersion(repo)}|${service}|${version2 ? 2 : 0}`;
+  const hit = ADVERTISEMENTS.get(cacheKey);
+  if (hit) return hit;
+  const built = buildAdvertisement(repo, service, version2);
+  if (ADVERTISEMENTS.size >= ADVERTISEMENTS_MAX) ADVERTISEMENTS.clear();
+  ADVERTISEMENTS.set(cacheKey, built);
+  return built;
+}
+
+function buildAdvertisement(repo: Repo, service: string, version2: boolean): Buffer {
   if (service === 'git-upload-pack' && version2) {
     return Buffer.concat([
       pkt('version 2\n'),
@@ -84,24 +103,48 @@ export function advertiseInfoRefs(repo: Repo, service: string, version2: boolean
   return Buffer.concat(chunks);
 }
 
-/** Packfiles for a clone of the same tips are identical: keep the last few, and
- *  share one build between requests that arrive together. */
-const PACK_CACHE = new Map<string, Promise<Buffer>>();
+/** Packfiles for a clone of the same tips are identical: keep a few, share one build
+ *  between requests that arrive together, and keep the framed side-band body too. */
+const PACK_CACHE = new Map<string, { ids: string; pack: Promise<Buffer> }>();
 const PACK_CACHE_MAX = 24;
+const PACK_FRAMED = new Map<string, Buffer>();
+const PACK_FRAMED_MAX = 24;
 
-function cachedPack(store: Store, repo: Repo, ids: string[]): Promise<Buffer> {
-  const key = `${repo.id}|${ids.length}|${ids[0] ?? ''}|${ids[ids.length - 1] ?? ''}`;
+function packKey(repo: Repo, ids: string[]): string {
+  return `${repo.id}|${ids.length}|${ids[0] ?? ''}|${ids[ids.length - 1] ?? ''}`;
+}
+
+function cachedPack(repo: Repo, ids: string[], store: Store): Promise<Buffer> {
+  const key = packKey(repo, ids);
   const hit = PACK_CACHE.get(key);
-  if (hit) return hit;
+  if (hit && hit.ids === ids.join(',')) return hit.pack;
+  const idsText = ids.join(',');
   const pending = Promise.resolve().then(() => writePack(ids, (sha) => store.read(sha)));
   if (PACK_CACHE.size >= PACK_CACHE_MAX) {
     const first = PACK_CACHE.keys().next().value;
     if (first !== undefined) PACK_CACHE.delete(first);
   }
-  PACK_CACHE.set(key, pending);
+  PACK_CACHE.set(key, { ids: idsText, pack: pending });
   return pending;
 }
 
+const PACK_CHUNK = 48 * 1024;
+
+/** The `packfile` section of a v2 fetch, framed once per (repository, ids) and reused. */
+function framedPackSection(repo: Repo, ids: string[], store: Store): Promise<Buffer> {
+  const key = packKey(repo, ids);
+  const hit = PACK_FRAMED.get(key);
+  if (hit) return Promise.resolve(hit);
+  return cachedPack(repo, ids, store).then((pack) => {
+    const out: Buffer[] = [pkt('packfile\n')];
+    for (let i = 0; i < pack.length; i += PACK_CHUNK) out.push(sideband(1, pack.subarray(i, i + PACK_CHUNK)));
+    out.push(FLUSH);
+    const framed = Buffer.concat(out);
+    if (PACK_FRAMED.size >= PACK_FRAMED_MAX) PACK_FRAMED.clear();
+    PACK_FRAMED.set(key, framed);
+    return framed;
+  });
+}
 
 export async function uploadPackV2(store: Store, repo: Repo, body: Buffer): Promise<Buffer> {
   const { packets } = parsePackets(body);
@@ -211,11 +254,9 @@ export async function uploadPackV2(store: Store, repo: Repo, body: Buffer): Prom
       for (const sha of [...shallow, ...newShallow]) out.push(pkt(`shallow ${sha}\n`));
       out.push(DELIM);
     }
-    out.push(pkt('packfile\n'));
-    const pack = await cachedPack(store, repo, payloadIds);
-    const CHUNK = 48 * 1024;
-    for (let i = 0; i < pack.length; i += CHUNK) out.push(sideband(1, pack.subarray(i, i + CHUNK)));
-    out.push(FLUSH);
+    // No shallow-info and no haves: the whole reply is the cached packfile section.
+    if (out.length === 0) return await framedPackSection(repo, payloadIds, store);
+    out.push(await framedPackSection(repo, payloadIds, store));
     return Buffer.concat(out);
   }
 

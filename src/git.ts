@@ -63,6 +63,18 @@ export function parseCommit(body: Buffer): Commit {
   return c;
 }
 
+/** The parsed form of a commit body, memoised: a clone walks the same commits a lot. */
+const COMMIT_CACHE = new Map<string, Commit>();
+
+export function parseCommitCached(sha: string, body: Buffer): Commit {
+  const hit = COMMIT_CACHE.get(sha);
+  if (hit) return hit;
+  const parsed = parseCommit(body);
+  if (COMMIT_CACHE.size >= 20_000) COMMIT_CACHE.clear();
+  COMMIT_CACHE.set(sha, parsed);
+  return parsed;
+}
+
 export function buildCommit(c: Commit): Buffer {
   const lines = [`tree ${c.tree}`];
   for (const p of c.parents) lines.push(`parent ${p}`);
@@ -170,6 +182,8 @@ export function readPack(pack: Buffer): { objects: Map<string, PackedObject>; or
   const objects = new Map<string, PackedObject>();
   const order: string[] = [];
   const byOffset = new Map<number, string>();
+  // One view of the payload region: subarray per object would copy the cursor each time.
+  const payload = pack.subarray(0, end);
   let p = 12;
 
   for (let n = 0; n < count; n++) {
@@ -194,7 +208,7 @@ export function readPack(pack: Buffer): { objects: Map<string, PackedObject>; or
       const baseId = byOffset.get(at - off);
       if (!baseId) throw new Error(`offset delta base missing at ${at - off}`);
       const base = objects.get(baseId)!;
-      const inf = inflateAt(pack.subarray(0, end), p);
+      const inf = inflateAt(payload, p);
       p += inf.used;
       payloadBytes = inf.data.length;
       body = applyDelta(base.body, inf.data);
@@ -204,7 +218,7 @@ export function readPack(pack: Buffer): { objects: Map<string, PackedObject>; or
       p += 20;
       const base = objects.get(baseId);
       if (!base) throw new Error(`ref delta base missing ${baseId}`);
-      const inf = inflateAt(pack.subarray(0, end), p);
+      const inf = inflateAt(payload, p);
       p += inf.used;
       payloadBytes = inf.data.length;
       body = applyDelta(base.body, inf.data);
@@ -212,7 +226,7 @@ export function readPack(pack: Buffer): { objects: Map<string, PackedObject>; or
     } else {
       const t = NUM_TYPE[type];
       if (!t) throw new Error(`bad object type ${type}`);
-      const inf = inflateAt(pack.subarray(0, end), p);
+      const inf = inflateAt(payload, p);
       p += inf.used;
       payloadBytes = inf.data.length;
       body = inf.data;
@@ -228,6 +242,19 @@ export function readPack(pack: Buffer): { objects: Map<string, PackedObject>; or
     byOffset.set(at, id);
   }
   return { objects, order };
+}
+
+/** Deflated payloads, by object id: a pack built twice for the same objects skips zlib. */
+const DEFLATED = new Map<string, { type: ObjType; raw: Buffer }>();
+const DEFLATED_MAX = 8_000;
+
+function deflatedOf(id: string, obj: PackedObject): Buffer {
+  const hit = DEFLATED.get(id);
+  if (hit && hit.type === obj.type) return hit.raw;
+  const raw = deflateSync(obj.body, { level: 1 });
+  if (DEFLATED.size >= DEFLATED_MAX) DEFLATED.clear();
+  DEFLATED.set(id, { type: obj.type, raw });
+  return raw;
 }
 
 /** Writes a packfile holding `ids` in order, every object whole (no deltas). */
@@ -252,7 +279,7 @@ export function writePack(ids: string[], read: (sha: string) => PackedObject | n
       size >>>= 7;
     }
     bytes.push(first);
-    bodyChunks.push(Buffer.from(bytes), deflateSync(obj.body, { level: 1 }));
+    bodyChunks.push(Buffer.from(bytes), deflatedOf(id, obj));
     written++;
   }
   header.writeUInt32BE(written, 8);
