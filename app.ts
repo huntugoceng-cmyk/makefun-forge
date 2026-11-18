@@ -120,7 +120,7 @@ export function createApp(options: AppOptions = {}): { server: Server; store: St
       if (rest === '/git-upload-pack' && req.method === 'POST') {
         const protocol = String(req.headers['git-protocol'] ?? '');
         const payload = protocol.includes('version=2')
-          ? uploadPackV2(store, repo, body)
+          ? await uploadPackV2(store, repo, body)
           : uploadPackV0(store, repo, body);
         res.writeHead(200, {
           'content-type': 'application/x-git-upload-pack-result',

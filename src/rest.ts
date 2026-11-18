@@ -99,6 +99,19 @@ function issueJson(ctx: Ctx, repo: Repo, issue: Issue) {
   };
 }
 
+/** Rendered issue bodies, reused until the issue changes. */
+const ISSUE_JSON_CACHE = new Map<number, { sig: string; json: ReturnType<typeof issueJson> }>();
+
+function issueJsonCached(ctx: Ctx, repo: Repo, issue: Issue) {
+  const sig = `${ctx.base}|${issue.updatedAt}|${issue.state}|${issue.comments.length}|${issue.labels.join(',')}|${issue.title}|${issue.body}`;
+  const hit = ISSUE_JSON_CACHE.get(issue.id);
+  if (hit && hit.sig === sig) return hit.json;
+  const json = issueJson(ctx, repo, issue);
+  if (ISSUE_JSON_CACHE.size > 5000) ISSUE_JSON_CACHE.clear();
+  ISSUE_JSON_CACHE.set(issue.id, { sig, json });
+  return json;
+}
+
 function pullJson(ctx: Ctx, repo: Repo, pull: Pull) {
   const full = `${repo.owner}/${repo.name}`;
   const headRef = repo.refs.get(`refs/heads/${pull.head}`) ?? pull.headSha;
@@ -636,7 +649,7 @@ export function handleRest(ctx: Ctx): boolean {
     const issue = list.find((i) => i.number === num && !i.isPull);
     if (ctx.method === 'GET') {
       if (!issue) { notFound(ctx); return true; }
-      ctx.json(200, issueJson(ctx, repo, issue));
+      ctx.json(200, issueJsonCached(ctx, repo, issue));
       return true;
     }
     if (ctx.method === 'PATCH') {

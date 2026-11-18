@@ -84,25 +84,26 @@ export function advertiseInfoRefs(repo: Repo, service: string, version2: boolean
   return Buffer.concat(chunks);
 }
 
-/** Packfiles for a clone of the same tips are identical: keep the last few. */
-const PACK_CACHE = new Map<string, Buffer>();
+/** Packfiles for a clone of the same tips are identical: keep the last few, and
+ *  share one build between requests that arrive together. */
+const PACK_CACHE = new Map<string, Promise<Buffer>>();
 const PACK_CACHE_MAX = 24;
 
-function cachedPack(store: Store, repo: Repo, ids: string[]): Buffer {
+function cachedPack(store: Store, repo: Repo, ids: string[]): Promise<Buffer> {
   const key = `${repo.id}|${ids.length}|${ids[0] ?? ''}|${ids[ids.length - 1] ?? ''}`;
   const hit = PACK_CACHE.get(key);
   if (hit) return hit;
-  const pack = writePack(ids, (sha) => store.read(sha));
+  const pending = Promise.resolve().then(() => writePack(ids, (sha) => store.read(sha)));
   if (PACK_CACHE.size >= PACK_CACHE_MAX) {
     const first = PACK_CACHE.keys().next().value;
     if (first !== undefined) PACK_CACHE.delete(first);
   }
-  PACK_CACHE.set(key, pack);
-  return pack;
+  PACK_CACHE.set(key, pending);
+  return pending;
 }
 
-/** Protocol v2 request: command and its arguments. */
-export function uploadPackV2(store: Store, repo: Repo, body: Buffer): Buffer {
+
+export async function uploadPackV2(store: Store, repo: Repo, body: Buffer): Promise<Buffer> {
   const { packets } = parsePackets(body);
   let command = '';
   const args: string[] = [];
@@ -211,7 +212,7 @@ export function uploadPackV2(store: Store, repo: Repo, body: Buffer): Buffer {
       out.push(DELIM);
     }
     out.push(pkt('packfile\n'));
-    const pack = cachedPack(store, repo, payloadIds);
+    const pack = await cachedPack(store, repo, payloadIds);
     const CHUNK = 48 * 1024;
     for (let i = 0; i < pack.length; i += CHUNK) out.push(sideband(1, pack.subarray(i, i + CHUNK)));
     out.push(FLUSH);
